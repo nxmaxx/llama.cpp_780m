@@ -3806,8 +3806,18 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
     // at once and end up thrashing the cache. Fix this by setting a large (unused) shmem buffer that reduces occupancy.
     // This targets an occupancy of 4 subgroups per SIMD.
+    // For RDNA3 (gfx1100-gfx1103): Wave64 architecture with 12 CU, optimized for 64-thread workgroups
     if (device->vendor_id == VK_VENDOR_ID_AMD && device->properties.limits.maxComputeSharedMemorySize == 65536) {
-        if (device->architecture != AMD_GCN && n_rows >= 64 && hsk <= 128) {
+        if (device->architecture == AMD_RDNA3) {
+            // RDNA3 optimization: Wave64 architecture benefits from larger workgroups
+            // Target 2-3 waves per CU for memory-bound workloads on 12 CU GPU
+            if (n_rows >= 32 && hsk <= 256) {
+                result.limit_occupancy_shmem = 24 * 1024 / 4 / 4;  // 24KB for balanced occupancy
+            } else if (n_rows < 32 && hsk > 256) {
+                // Low-batch FA with large head size - reduce occupancy further
+                result.limit_occupancy_shmem = 16 * 1024 / 4 / 4;  // 16KB for better cache usage
+            }
+        } else if (device->architecture != AMD_GCN && n_rows >= 64 && hsk <= 128) {
             // 30kb target for hsk > 64, 26kb for <= 64 due to smaller workgroup size
             // Values are guessed, tested on RDNA2
             result.limit_occupancy_shmem = (hsk <= 64 ? 26 : 30) * 1024 / 4 / 4;
@@ -3927,6 +3937,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+    // RDNA3 (gfx1100-gfx1103) uses RADV driver with better shader compilation - no workaround needed
+    // Only apply old_amd_windows workaround for GCN, RDNA1, and RDNA2 with proprietary Windows driver
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4121,7 +4133,47 @@ static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
 };
 
+// Pipeline configuration for RDNA3 GPUs (gfx1100-gfx1103).
+// RDNA3 uses Wave64 architecture - optimal subgroup size is 64.
+// Key optimizations for RDNA3:
+// - Wave64 (not Wave32 like HIP/ROCm)
+// - 12 CU on 780M (gfx1103)
+// - 64KB shared memory per workgroup
+// - UMA architecture with DDR5/LPDDR5
+static const std::unordered_map<std::string, uint32_t> rdna3_pipelines = {
+    // GEMM operations - use 64 threads (one wave)
+    {"mul_mat", 64}, {"mul_mat_id", 64},
+    // Vector-matrix for token generation (batch=1)
+    {"mul_mat_vec", 64}, {"mul_mat_vec_f16", 64}, {"mul_mat_vec_f32_f16", 64},
+    // Attention kernels - two waves for better latency hiding
+    {"flash_attn", 128}, {"flash_attn_split_k_reduce", 64},
+    // Normalization - match wavefront size
+    {"norm", 64}, {"rms_norm", 64}, {"rms_norm_back", 64},
+    // Softmax - use subgroup operations
+    {"soft_max", 64}, {"soft_max_back", 64},
+    {"soft_max_large1", 64}, {"soft_max_large2", 64}, {"soft_max_large3", 64},
+    // Dequantization - coalesced access patterns
+    {"dequant", 64}, {"dequant_f32", 64},
+    {"dequant_q4_0", 64}, {"dequant_q4_1", 64}, {"dequant_q8_0", 64},
+    {"dequant_q2_k", 64}, {"dequant_q3_k", 64}, {"dequant_q4_k", 64},
+    {"dequant_q5_k", 64}, {"dequant_q6_k", 64},
+    // Copy and memory operations
+    {"copy", 64}, {"contig_copy", 64}, {"copy_transpose", 64},
+    // Element-wise operations
+    {"add", 64}, {"sub", 64}, {"mul", 64}, {"div", 64},
+    {"scale", 64}, {"log", 64},
+    // Other operations
+    {"argmax", 64}, {"argsort", 64}, {"im2col", 64},
+    {"concat", 64}, {"repeat", 64}, {"repeat_back", 64},
+    {"rope", 64}, {"rope_neox", 64}, {"rope_norm", 64},
+    {"gelu", 64}, {"gelu_quick", 64}, {"silu", 64},
+    {"relu", 64}, {"abs", 64}, {"neg", 64},
+    {"clamp", 64}, {"sign", 64}, {"step", 64},
+};
+
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
+// RDNA3 default subgroup size is 64 (Wave64 architecture)
+static constexpr uint32_t RDNA3_DEFAULT_SUBGROUP_SIZE = 64;
 
 // Define configurations for different GPUs.
 static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
@@ -4138,6 +4190,13 @@ static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
             rdna2_pipelines,
         },
         RDNA_DEFAULT_SUBGROUP_SIZE
+    },
+    {
+        vk_device_architecture::AMD_RDNA3,
+        {
+            rdna3_pipelines,
+        },
+        RDNA3_DEFAULT_SUBGROUP_SIZE
     },
 };
 
@@ -4340,6 +4399,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
+        } else if (device->architecture == AMD_RDNA3 && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
+            // RDNA3 (gfx1100-gfx1103) optimization: Wave64 architecture with 12 CU
+            // Use larger tiles for better L2 cache utilization (2MB L2 on 780M)
+            // Optimal tile size: 32×32×64 fits well in 2MB L2 cache
+            l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
+            l_warptile_mmq_int_k = { 256, 128, 128, 32, mm_warp_16, 64, 1, 4, 2, 1, mm_warp_16 };
+            // M and S warptiles optimized for token generation (batch=1)
+            m_warptile = { 128, 64, 64, 16, mul_mat_mm_warp_8, 32, 2, tm_m, tn_m, tk_m, mul_mat_mm_warp_8 };
+            s_warptile = { mul_mat_subgroup_size_32, 32, 32, 16, s_warptile_wm, 16, 2, tm_m, tn_m, tk_m, s_warptile_wm };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
             // This is intentionally using tx_m values, slight performance increase
             l_warptile = { 256, 128, 128, 16, mm_warp_8, 64, 2, tm_m, tn_m, tk_m, mm_warp_8 };
